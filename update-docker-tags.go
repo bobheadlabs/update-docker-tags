@@ -17,17 +17,18 @@ import (
 	"github.com/pkg/errors"
 )
 
-// TODO: make this not Sourcegraph-specific
-var TAG_PATTERN = regexp.MustCompile(`(sourcegraph/.+):(.+)@(sha256:[[:alnum:]]+)`)
-
 var (
-	constraintArgs rawConstraints
-	enforceArgs    rawConstraints
+	constraintArgs  rawConstraints
+	enforceArgs     rawConstraints
+	matchImagePaths bool
+	tagPatternRaw   string
 )
 
 const (
-	helpConstraint = "perform semver update on given docker image to satisfy semver constraint (repeatable)"
-	helpEnforce    = "override given docker image to enforce a semver constraint (repeatable)"
+	helpConstraint     = "perform semver update on given docker image to satisfy semver constraint (repeatable)"
+	helpEnforce        = "override given docker image to enforce a semver constraint (repeatable)"
+	hepMatchImagePaths = "allow path-based matching on docker images provided in -constraint and -enforce (e.g. 'foo/bar/star' matches 'foo/bar' and 'foo')"
+	helpTagPattern     = "regex pattern for matching tags"
 )
 
 func main() {
@@ -38,8 +39,10 @@ Usage:
 	update-docker-tags [options] < FILE | FOLDER >...
 
 Options:
-	--constraint  %s 
-	--enforce     %s
+	-constraint          %s 
+	-enforce             %s
+	-match-image-paths   %s
+	-tag-pattern         %s
 
 Examples:
 
@@ -49,16 +52,22 @@ Examples:
 
 	Update all image tags in the given files and folders, satisfying constraints:
 
-	$ update-docker-tags --constraint=ubuntu=<18.04 --constraint=alpine=<3.10 deployment.yaml dir/ 
+	$ update-docker-tags -constraint=ubuntu=<18.04 -constraint=alpine=<3.10 deployment.yaml dir/ 
 
 	Override all tags in the given files and folders to enforce a constraint:
 
-	$ update-docker-tags --enforce=sourcegraph/frontend=~3.19
-`, helpConstraint, helpEnforce)
+	$ update-docker-tags -enforce=sourcegraph/frontend=~3.19 dir/
+
+	Override all tags in Sourcegraph images (e.g. 'index.docker.io/sourcegraph/foo', 'index.docker.io/sourcegraph/bar'):
+
+	$ update-docker-tags -match-image-paths -tag-pattern="[^index.docker.io](sourcegraph/.+):(.+)@(sha256:[[:alnum:]]+))" -enforce=sourcegraph=~3.19
+`, helpConstraint, helpEnforce, hepMatchImagePaths, helpTagPattern)
 		os.Exit(2)
 	}
 	flag.Var(&constraintArgs, "constraint", helpConstraint)
 	flag.Var(&enforceArgs, "enforce", helpEnforce)
+	flag.BoolVar(&matchImagePaths, "match-image-paths", false, hepMatchImagePaths)
+	flag.StringVar(&tagPatternRaw, "tag-pattern", `(sourcegraph\/.+):(.+)@(sha256:[[:alnum:]]+)`, helpTagPattern)
 
 	flag.Parse()
 
@@ -78,13 +87,14 @@ Examples:
 	}
 
 	o := &options{
-		constraints: parsedConstraints,
-		enforce:     parsedEnforce,
-		filePaths:   paths,
+		constraints:     parsedConstraints,
+		enforce:         parsedEnforce,
+		filePaths:       paths,
+		matchImagePaths: matchImagePaths,
 	}
 
 	for _, root := range o.filePaths {
-		if err := updateDockerTags(o, root); err != nil {
+		if err := updateDockerTags(o, root, regexp.MustCompile(tagPatternRaw)); err != nil {
 			log.Fatalf("failed to update docker tags for root %q, err: %s", root, err)
 		}
 	}
@@ -93,7 +103,7 @@ Examples:
 
 // UpdateDockerTags updates the Docker tags for the entire file tree rooted at
 // "root" using the provided constraints.
-func updateDockerTags(o *options, root string) error {
+func updateDockerTags(o *options, root string, tagPattern *regexp.Regexp) error {
 	return filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if info.IsDir() {
 			return nil
@@ -113,7 +123,7 @@ func updateDockerTags(o *options, root string) error {
 
 		// replaceErr is a workaround for replaceAllSubmatchFunc not propagating errors
 		var replaceErr error
-		data = replaceAllSubmatchFunc(TAG_PATTERN, data, func(groups [][]byte) [][]byte {
+		data = replaceAllSubmatchFunc(tagPattern, data, func(groups [][]byte) [][]byte {
 
 			repositoryName := string(groups[0])
 			repository, err := newRepository(o, repositoryName)
@@ -385,28 +395,55 @@ func (rc *rawConstraints) parse() (map[string]*semver.Constraints, error) {
 }
 
 type options struct {
-	constraints map[string]*semver.Constraints
-	enforce     map[string]*semver.Constraints
-	filePaths   []string
+	constraints     map[string]*semver.Constraints
+	enforce         map[string]*semver.Constraints
+	filePaths       []string
+	matchImagePaths bool
 }
 
+// newRepository generates a valid auth token for the given repository as well
+// as any configured constraints/enforces for this repository.
+//
+// If matchImagePaths is enabled, we also provide constraints/enforces where
+// the repositoryName has parents in its path that match configured constraints.
+//
+// For example, for repository `foo/bar/star` we also check if a constraint
+// exists for `foo/bar` and `foo`
 func newRepository(o *options, repositoryName string) (*repository, error) {
 	token, err := fetchAuthToken(repositoryName)
 	if err != nil {
 		return nil, errors.Wrap(err, "when fetching auth token")
 	}
-	if enforce, exists := o.enforce[repositoryName]; exists {
-		return &repository{
-			name:              repositoryName,
-			constraint:        enforce,
-			enforceConstraint: true,
-			authToken:         token,
-		}, nil
+
+	subpathIndex := len(repositoryName)
+	for subpathIndex > 0 {
+		match := repositoryName[:subpathIndex]
+		if enforce, exists := o.enforce[match]; exists {
+			return &repository{
+				name:              repositoryName,
+				constraint:        enforce,
+				enforceConstraint: true,
+				authToken:         token,
+			}, nil
+		}
+		if constraint, exists := o.constraints[match]; exists {
+			return &repository{
+				name:       repositoryName,
+				constraint: constraint,
+				authToken:  token,
+			}, nil
+		}
+
+		if o.matchImagePaths {
+			subpathIndex = strings.LastIndex(match, "/")
+		} else {
+			break
+		}
 	}
+
 	return &repository{
 		name:       repositoryName,
-		constraint: o.constraints[repositoryName],
-
-		authToken: token,
+		constraint: nil,
+		authToken:  token,
 	}, nil
 }
